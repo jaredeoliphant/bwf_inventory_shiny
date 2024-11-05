@@ -2,3 +2,5 @@ shiny
 pandas
 python-dotenv
 arcgis==1.8.1
+numpy==1.24.1
+bcrypt
