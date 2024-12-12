@@ -50,6 +50,24 @@ def get_raw_inventory(as_sdf=True):
         return inventoryFeatureLayer.query().sdf
     return inventoryFeatureLayer.query().features
 
+usersFeatureLayer = gis.content.get(os.getenv("USERS")).tables[0]
+def get_raw_users(as_sdf=True):
+    if as_sdf:
+        return usersFeatureLayer.query().sdf
+    return usersFeatureLayer.query().features
+
+
+logFeatureLayer = gis.content.get(os.getenv("LOG")).tables[0]  
+def log_inventory_change(item, previous_qtys, new_qtys, user):
+    ## previous_qtys new_qtys should be single element lists if we did this right
+    ## item and user should be a single string
+    noww = (
+        pd.to_datetime("now") - pd.Timestamp("1970-01-01")
+    ) // pd.Timedelta("1ms")
+
+    data = {'username':user,'item_changed':item,'previous_qty':previous_qtys[0],'new_qty':new_qtys[0],'date_time':noww}
+    result = logFeatureLayer.edit_features(adds=[{'attributes':data}])
+    return result
 
 def add_inventory_item(data):
     # shouldn't be needed
@@ -70,12 +88,16 @@ def change_inventory_qty(items_to_change, long=True):
         colname = "ShortDesc"
     raw_inv = get_raw_inventory(False)
     final_updates = []
+    old_qtys = []
+    new_qtys = []
     for k, v in items_to_change.items():
         item_feature = [f for f in raw_inv if f.attributes[colname] == k][0]
+        old_qtys.append(item_feature.attributes['Quantity'])
         item_feature.attributes["Quantity"] = v
+        new_qtys.append(v)
         final_updates.append(item_feature)
     result = inventoryFeatureLayer.edit_features(updates=final_updates)
-    return result
+    return result, old_qtys, new_qtys
 
 
 def check_inventory_availability(items_dict, long=False):
@@ -87,8 +109,9 @@ def check_inventory_availability(items_dict, long=False):
     issues = []
     for item, qty in items_dict.items():
         inv_qty = inventory.loc[inventory[colname] == item, "Quantity"].iloc[0]
+        inv_long_name = inventory.loc[inventory[colname] == item, "LongDesc"].iloc[0]
         if qty > inv_qty:
-            issues.append(f"{item}: Requested {qty}, Available {inv_qty}")
+            issues.append(f"{inv_long_name}: Requested {qty}, Available {inv_qty}")
     return issues
 
 
@@ -156,7 +179,7 @@ def get_nav_items(logged_in):
                         ui.input_select(
                             "item_select",
                             "Select Item",
-                            choices=get_raw_inventory()["LongDesc"].tolist(),
+                            choices=get_raw_inventory().sort_values('LongDesc')["LongDesc"].tolist(),
                             width="100%",
                         ),
                         ui.input_numeric(
@@ -229,6 +252,9 @@ def server(input, output, session):
     editing_order = reactive.value(False)
     data_version = reactive.value(0)
     logged_in = reactive.value(False)
+    user_logged_in = reactive.value(None)
+    user_permissions = reactive.value(None)
+
 
     @render.image
     def icon_img():
@@ -249,13 +275,14 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.login)
     def handle_login():
-        users = {
-            os.getenv("LOGIN1"): os.getenv("LOGINPASSWORD1"),
-            os.getenv("LOGIN2"): os.getenv("LOGINPASSWORD2"),
-            os.getenv("LOGIN3"): os.getenv("LOGINPASSWORD3"),
-        }
-        if bcrypt.checkpw(input.password().encode("utf-8"), users[input.username()].encode("utf-8")):
+        raw_users = get_raw_users(False)
+        user_data = [u for u in raw_users if u.attributes['username'] == input.username()][0] 
+        hashed_password = user_data.attributes['hashed_password']
+        permissions = user_data.attributes['permissions']
+        if bcrypt.checkpw(input.password().encode("utf-8"), hashed_password.encode("utf-8")):
             logged_in.set(True)
+            user_logged_in.set(input.username())
+            user_permissions.set(permissions)
         else:
             ui.notification_show("Invalid login credentials!", type="error")
 
@@ -298,6 +325,8 @@ def server(input, output, session):
             df = df[df["status"] == input.status_filter()]
 
         order = df.iloc[selected[0]]
+
+        # print(order)
 
         detail_ui = ui.div(
             ui.h4(f"Order #{order['order_id']}"),
@@ -433,6 +462,7 @@ def server(input, output, session):
         return render.DataTable(
             (
                 get_raw_inventory()
+                .sort_values('LongDesc')
                 .loc[:, ["LongDesc", "Quantity"]]
                 .rename(columns={"LongDesc": "Item Description"})
             ),
@@ -442,7 +472,8 @@ def server(input, output, session):
     def update_inventory_count():
         item = input.item_select()
         new_quantity = input.new_quantity()
-        change_inventory_qty({item: new_quantity})
+        _, previous_qtys, new_qtys = change_inventory_qty({item: new_quantity})
+        log_inventory_change(item, previous_qtys, new_qtys, user_logged_in())
         ui.notification_show(
             f"Updated {item} quantity to {new_quantity}", type="message", duration=3
         )
